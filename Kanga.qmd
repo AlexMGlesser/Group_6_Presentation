@@ -1,0 +1,211 @@
+---
+title: "Kanga"
+format: html
+editor: visual
+---
+
+```{r}
+###############################################################################
+# generate_data.R
+#
+# Generates a CSV file "pollard_data.csv" with 10,000 rows of (g, p, h).
+#   - p is a random prime in [1000..5000].
+#   - g and h are random integers in [2..(p-1)].
+###############################################################################
+
+# A simple prime-check function (for demonstration).
+# For larger ranges or performance, consider specialized libraries (e.g. 'gmp', 'numbers').
+is_prime <- function(n) {
+  if (n < 2)  return(FALSE)
+  if (n == 2) return(TRUE)
+  if (n %% 2 == 0) return(FALSE)
+  limit <- floor(sqrt(n))
+  for (i in seq(3, limit, by = 2)) {
+    if (n %% i == 0) {
+      return(FALSE)
+    }
+  }
+  return(TRUE)
+}
+
+# Gather a list of primes in the range [1000..5000]
+prime_candidates <- 1000:5000
+prime_list <- prime_candidates[sapply(prime_candidates, is_prime)]
+
+# Number of test runs
+N <- 10000
+
+# Create a data frame to hold (g, p, h)
+df <- data.frame(
+  g = integer(N),
+  p = integer(N),
+  h = integer(N)
+)
+
+set.seed(123)  # For reproducibility
+
+# Populate each row
+for (i in seq_len(N)) {
+  # Pick a random prime
+  p_val <- sample(prime_list, 1)
+  
+  # Choose g and h in [2..p_val-1]
+  g_val <- sample(seq(2, p_val - 1), 1)
+  h_val <- sample(seq(2, p_val - 1), 1)
+  
+  df$g[i] <- g_val
+  df$p[i] <- p_val
+  df$h[i] <- h_val
+}
+
+# Write to CSV
+write.csv(df, "pollard_data.csv", row.names = FALSE)
+
+cat("pollard_data.csv has been created with 10,000 rows.\n")
+
+```
+
+```{r}
+###############################################################################
+# kangaroo_runs_parallel_win.R
+#
+# Implements Pollard's Kangaroo algorithm with safe modular exponentiation,
+# parallelized on Windows via a PSOCK cluster. 
+# Fix: Tame kangaroo walks downward => final expression can't go negative.
+###############################################################################
+
+library(parallel)
+
+# ---------------------------
+# 1) Safe modular exponentiation (repeated squaring) to avoid overflow.
+# ---------------------------
+mod_exp <- function(base, exponent, modulus) {
+  base <- base %% modulus
+  result <- 1
+  e <- exponent
+  
+  while (e > 0) {
+    if (e %% 2 == 1) {
+      result <- (result * base) %% modulus
+    }
+    base <- (base * base) %% modulus
+    e <- e %/% 2
+  }
+  return(result)
+}
+
+# ---------------------------
+# 2) f_step function: (2^(x mod N)) mod N, using mod_exp
+# ---------------------------
+f_step <- function(x, N) {
+  return(as.numeric(mod_exp(2, x %% N, N)))
+}
+
+# ---------------------------
+# 3) Pollard's Kangaroo (Tame: b -> down)
+# ---------------------------
+pollards_kangaroo <- function(g, h, p, a, b) {
+  # N = size of the interval
+  N <- b - a
+  
+  # Tame kangaroo starts at x_tame = b, so we do g^b mod p
+  x_tame <- b
+  y_tame <- mod_exp(g, x_tame, p)
+  
+  # Move downward for N steps
+  for (i in seq_len(N)) {
+    step_tame <- f_step(y_tame, N)  # e.g. (2^(y_tame mod N)) mod N
+    x_tame    <- x_tame - step_tame  # Tame moves *down*
+    y_tame    <- (y_tame * mod_exp(g, step_tame, p)) %% p
+  }
+  
+  # Wild kangaroo: x_wild = 0, y_wild = h
+  x_wild <- 0
+  y_wild <- h
+  
+  for (i in seq_len(N)) {
+    step_wild <- f_step(y_wild, N)
+    x_wild    <- x_wild + step_wild
+    y_wild    <- (y_wild * mod_exp(g, step_wild, p)) %% p
+    
+    # Collision => return discrete log
+    # Now the formula is: b - x_tame + x_wild
+    if (!is.na(y_wild) && !is.na(y_tame) && (y_wild == y_tame)) {
+      return(b - x_tame + x_wild)
+    }
+  }
+  
+  # If not found
+  return(NA)
+}
+
+# ---------------------------
+# 4) Read dataset
+# ---------------------------
+data <- read.csv("pollard_data.csv")
+cat("Loaded", nrow(data), "rows from pollard_data.csv.\n")
+
+# Interval [a, b] for the exponent
+a <- 1
+b <- 1000  # smaller for demonstration; keep in mind performance at large intervals
+
+# ---------------------------
+# 5) Create PSOCK cluster for Windows parallelism
+# ---------------------------
+num_cores <- detectCores() - 1
+cat("Creating a PSOCK cluster with", num_cores, "cores...\n")
+cl <- makeCluster(num_cores)
+
+# Export required objects to each worker
+clusterExport(cl, c("pollards_kangaroo", "mod_exp", "f_step", "a", "b", "data"))
+
+# ---------------------------
+# 6) Time the parallel runs
+# ---------------------------
+start_time <- Sys.time()
+
+results_list <- parLapply(
+  cl,
+  seq_len(nrow(data)), 
+  function(i) {
+    g_val <- data$g[i]
+    p_val <- data$p[i]
+    h_val <- data$h[i]
+    # Each worker runs Pollard's Kangaroo on row i
+    x_found <- pollards_kangaroo(g_val, h_val, p_val, a, b)
+    return(x_found)
+  }
+)
+
+stopCluster(cl)
+
+end_time <- Sys.time()
+total_time <- end_time - start_time
+
+# Convert list to vector
+results <- unlist(results_list)
+
+# ---------------------------
+# 7) Print sample results & total runtime
+# ---------------------------
+cat("Discrete logs (first 10 results shown):\n")
+print(head(results, 10))
+
+cat("\nTotal runtime (HH:MM:SS):\n")
+print(total_time)
+
+# ---------------------------
+# 8) Optional: Simple runtime plot
+# ---------------------------
+plot(
+  x = c(0,1),
+  y = c(0, as.numeric(total_time)),
+  type = "o", pch = 16, col = "blue",
+  xlab = "Start -> End",
+  ylab = "Runtime (seconds)",
+  main = "Total Runtime of Pollard's Kangaroo (Parallel on Windows)",
+  xaxt = "n"
+)
+axis(1, at = c(0,1), labels = c("Start", "End"))
+
+```
